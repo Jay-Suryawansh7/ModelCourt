@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { RealtimeChannel } from "@supabase/supabase-js";
 import type { User, ChatGroup, Message, TypingUser } from "@/lib/types";
+import { AGENTS, AGENT_IDS } from "@/lib/agents";
 
 interface UseSocketReturn {
   connected: boolean;
@@ -212,11 +213,21 @@ export function useSocket(): UseSocketReturn {
       created_by: currentUser.id,
     });
 
+    // Add the human user
     await supabase.from("group_members").insert({
       group_id: groupId,
       user_id: currentUser.id,
       role: "admin",
     });
+
+    // Add all AI agents to the group
+    for (const agentId of AGENT_IDS) {
+      await supabase.from("group_members").insert({
+        group_id: groupId,
+        user_id: agentId,
+        role: "member",
+      });
+    }
 
     const newGroup: ChatGroup = { id: groupId, name, createdBy: currentUser.id };
 
@@ -260,15 +271,28 @@ export function useSocket(): UseSocketReturn {
   // Send a message
   const sendMessage = useCallback(async (content: string) => {
     if (!currentUser || !currentGroupId) return;
-    const { error } = await supabase.from("messages").insert({
+    const { data, error } = await supabase.from("messages").insert({
       group_id: currentGroupId,
       user_id: currentUser.id,
       content,
       name: currentUser.name,
       avatar: currentUser.avatar,
       type: "text",
-    });
-    if (error) console.error("Error sending message:", error);
+    }).select("id").single();
+
+    if (error) {
+      console.error("Error sending message:", error);
+      return;
+    }
+
+    // Trigger AI responses via API route
+    if (data?.id) {
+      fetch("/api/chat/respond", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ groupId: currentGroupId, messageId: data.id }),
+      }).catch((err) => console.error("AI respond error:", err));
+    }
   }, [currentUser, currentGroupId, supabase]);
 
   // Typing indicators - broadcast via channel
