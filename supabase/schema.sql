@@ -49,10 +49,20 @@ ALTER TABLE group_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 
 -- 4. RLS Policies (allow all for demo)
-CREATE POLICY "Allow all on users" ON users FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY "Allow all on chat_groups" ON chat_groups FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY "Allow all on group_members" ON group_members FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY "Allow all on messages" ON messages FOR ALL USING (true) WITH CHECK (true);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'users' AND policyname = 'Allow all on users') THEN
+    CREATE POLICY "Allow all on users" ON users FOR ALL USING (true) WITH CHECK (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'chat_groups' AND policyname = 'Allow all on chat_groups') THEN
+    CREATE POLICY "Allow all on chat_groups" ON chat_groups FOR ALL USING (true) WITH CHECK (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'group_members' AND policyname = 'Allow all on group_members') THEN
+    CREATE POLICY "Allow all on group_members" ON group_members FOR ALL USING (true) WITH CHECK (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'messages' AND policyname = 'Allow all on messages') THEN
+    CREATE POLICY "Allow all on messages" ON messages FOR ALL USING (true) WITH CHECK (true);
+  END IF;
+END $$;
 
 -- 5. Seed AI agent users
 INSERT INTO users (id, name, avatar) VALUES
