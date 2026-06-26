@@ -2,38 +2,37 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { AGENTS, type Agent } from "@/lib/agents";
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
+const NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
+const NVIDIA_MODEL = "stepfun-ai/step-3.7-flash";
 
-const SYSTEM_CORE = `You are part of an executive team in a group chat with your CEO.
-Rules you MUST follow:
-- Keep responses VERY short. 1-3 sentences max. This is a group chat, not a memo.
-- Write like a real human in a work group chat. Natural, casual, but professional.
-- Never introduce yourself. Never say "As the [role]..." Just answer.
-- Read the conversation history and respond naturally to what's being discussed.
-- Only chime in when you have something relevant to say. If you have nothing useful to add, stay quiet.
-- React to others' messages naturally — agree, disagree, build on ideas.
-- No bullet points. No numbered lists. No formatting. Plain text only.
-- Use occasional casual language: "yeah", "got it", "makes sense", "fair point", "hmm".
-- Be concise. A single sentence is often enough.`;
-
-function buildContext(messages: any[], agent: Agent): string {
-  const history = messages
-    .slice(-20)
+function buildConversation(messages: any[]): string {
+  return messages
+    .slice(-25)
     .map((m) => {
       const sender = m.name || "Unknown";
-      const isAgent = m.user_id?.startsWith("agent-");
-      if (isAgent && m.user_id === agent.id) return null;
       return `${sender}: ${m.content}`;
     })
-    .filter(Boolean)
     .join("\n");
-
-  return `Recent conversation:\n${history}\n\n${agent.name} (${agent.role}), your turn. Respond naturally in the group chat. Keep it short.`;
 }
 
+const ORCHESTRATOR_SYSTEM = `You orchestrate an executive group chat. Your job: decide which team members would naturally respond to the latest message, and generate their responses.
+
+Rules:
+- Only make team members speak who have something relevant to add based on their role.
+- If a topic is clearly about one domain, only that expert should respond.
+- Responses must be SHORT: 1-3 sentences. This is a group chat, not a memo.
+- Each response must sound like a real human in a work chat. Natural, casual, professional.
+- Never use bullet points, lists, or formatting. Plain text only.
+- Responses can react to what others said, agree, disagree, build on ideas.
+- The CEO is the human user who started the conversation.
+- Output as JSON: {"responses":[{"agent_id":"agent-xxx","content":"..."}]}
+- If no one should respond, output: {"responses":[]}
+- agent_id must be one of the valid agent IDs.`;
+
 export async function POST(req: NextRequest) {
-  if (!OPENAI_API_KEY) {
-    return NextResponse.json({ error: "OPENAI_API_KEY not configured" }, { status: 500 });
+  if (!NVIDIA_API_KEY) {
+    return NextResponse.json({ error: "NVIDIA_API_KEY not configured" }, { status: 500 });
   }
 
   try {
@@ -44,7 +43,6 @@ export async function POST(req: NextRequest) {
 
     const supabase = await createClient();
 
-    // Fetch the triggering message
     const { data: triggerMsg } = await supabase
       .from("messages")
       .select("*")
@@ -55,12 +53,10 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Message not found" }, { status: 404 });
     }
 
-    // Only trigger AI responses for human messages
     if (triggerMsg.user_id?.startsWith("agent-")) {
       return NextResponse.json({ skipped: true, reason: "agent message" });
     }
 
-    // Get group members to find which agents are in this group
     const { data: members } = await supabase
       .from("group_members")
       .select("user_id")
@@ -78,7 +74,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ skipped: true, reason: "no agents in group" });
     }
 
-    // Fetch recent message history
     const { data: recentMessages } = await supabase
       .from("messages")
       .select("*")
@@ -87,69 +82,108 @@ export async function POST(req: NextRequest) {
       .limit(30);
 
     const allMessages = recentMessages || [];
+    const conversation = buildConversation(allMessages);
 
-    // Decide which agents respond (not all respond every time)
-    const agentsToRespond = agentMembers.filter(() => Math.random() < 0.7);
+    // Build the team roster for the AI
+    const teamRoster = agentMembers
+      .map((m: any) => {
+        const agent = AGENTS.find((a) => a.id === m.user_id);
+        if (!agent) return null;
+        return `- ${agent.emoji} ${agent.name} (ID: ${agent.id}) — ${agent.role}`;
+      })
+      .filter(Boolean)
+      .join("\n");
 
-    if (agentsToRespond.length === 0) {
-      return NextResponse.json({ skipped: true, reason: "no agents decided to respond" });
+    const orchestratorPrompt = `You are orchestrating a work group chat. The CEO just sent a message.
+
+Team members available:
+${teamRoster}
+
+Recent conversation:
+${conversation}
+
+Which team members would naturally respond to this? Output JSON only.`;
+
+    // Single orchestrator call — one model decides everything
+    const nvidiaRes = await fetch(NVIDIA_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${NVIDIA_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: NVIDIA_MODEL,
+        messages: [
+          { role: "system", content: ORCHESTRATOR_SYSTEM },
+          { role: "system", content: AGENTS.map((a) => `${a.emoji} ${a.name} (${a.id}) — ${a.role}\nPersonality: ${a.systemPrompt.split("\n").slice(1, 4).join(" ")}`).join("\n\n") },
+          { role: "user", content: orchestratorPrompt },
+        ],
+        max_tokens: 1024,
+        temperature: 0.7,
+        top_p: 0.95,
+      }),
+    });
+
+    if (!nvidiaRes.ok) {
+      const errText = await nvidiaRes.text();
+      console.error("NVIDIA API error:", nvidiaRes.status, errText);
+      return NextResponse.json({ error: "NVIDIA API error" }, { status: 502 });
     }
 
-    const responses: { agent: Agent; content: string }[] = [];
+    const nvidiaData = await nvidiaRes.json();
+    const rawContent = nvidiaData.choices?.[0]?.message?.content?.trim();
 
-    for (const member of agentsToRespond) {
-      const agent = AGENTS.find((a) => a.id === member.user_id);
-      if (!agent) continue;
-
-      const context = buildContext(allMessages, agent);
-
-      const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          messages: [
-            { role: "system", content: SYSTEM_CORE },
-            { role: "system", content: agent.systemPrompt },
-            { role: "user", content: context },
-          ],
-          max_tokens: 150,
-          temperature: 0.8,
-        }),
-      });
-
-      if (!openaiRes.ok) continue;
-
-      const data = await openaiRes.json();
-      const content = data.choices?.[0]?.message?.content?.trim();
-      if (!content) continue;
-
-      responses.push({ agent, content });
+    if (!rawContent) {
+      return NextResponse.json({ skipped: true, reason: "empty response" });
     }
 
-    // Insert AI responses into Supabase
-    for (const { agent, content } of responses) {
+    // Parse JSON from response
+    let parsed: { responses: { agent_id: string; content: string }[] };
+    try {
+      const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(jsonMatch ? jsonMatch[0] : rawContent);
+    } catch {
+      console.warn("Failed to parse NVIDIA response as JSON:", rawContent);
+      return NextResponse.json({ skipped: true, reason: "parse failed" });
+    }
+
+    if (!parsed.responses || parsed.responses.length === 0) {
+      return NextResponse.json({ skipped: true, reason: "no agents responded" });
+    }
+
+    // Validate agent IDs and content
+    const validResponses = parsed.responses.filter((r) => {
+      const agent = AGENTS.find((a) => a.id === r.agent_id);
+      return agent && r.content && r.content.length > 5;
+    });
+
+    if (validResponses.length === 0) {
+      return NextResponse.json({ skipped: true, reason: "no valid responses" });
+    }
+
+    // Insert responses with staggered delays for natural feel
+    const result = [];
+    for (let i = 0; i < validResponses.length; i++) {
+      const r = validResponses[i];
+      const agent = AGENTS.find((a) => a.id === r.agent_id)!;
+
+      // Stagger: each agent responds with a delay (sent as separate timestamps)
+      const insertedAt = new Date(Date.now() + i * 2000).toISOString();
+
       await supabase.from("messages").insert({
         group_id: groupId,
         user_id: agent.id,
         name: agent.name,
         avatar: agent.avatar,
-        content,
+        content: r.content,
         type: "text",
+        created_at: insertedAt,
       });
+
+      result.push({ name: agent.name, role: agent.role, content: r.content });
     }
 
-    return NextResponse.json({
-      success: true,
-      responses: responses.map((r) => ({
-        name: r.agent.name,
-        role: r.agent.role,
-        content: r.content,
-      })),
-    });
+    return NextResponse.json({ success: true, responses: result });
   } catch (error: any) {
     console.error("AI response error:", error);
     return NextResponse.json({ error: error.message }, { status: 500 });
