@@ -46,20 +46,24 @@ export function useSocket(): UseSocketReturn {
 
   // Load groups from Supabase
   const loadGroups = useCallback(async (userId: string) => {
-    const { data } = await supabase
-      .from("group_members")
-      .select("group_id, chat_groups(id, name, created_by)")
-      .eq("user_id", userId);
+    try {
+      const { data } = await supabase
+        .from("group_members")
+        .select("group_id, chat_groups(id, name, created_by)")
+        .eq("user_id", userId);
 
-    if (data) {
-      const mapped: ChatGroup[] = data
-        .filter((gm: any) => gm.chat_groups)
-        .map((gm: any) => ({
-          id: gm.group_id,
-          name: gm.chat_groups.name,
-          createdBy: gm.chat_groups.created_by,
-        }));
-      setGroups(mapped);
+      if (data) {
+        const mapped: ChatGroup[] = data
+          .filter((gm: any) => gm.chat_groups)
+          .map((gm: any) => ({
+            id: gm.group_id,
+            name: gm.chat_groups.name,
+            createdBy: gm.chat_groups.created_by,
+          }));
+        setGroups(mapped);
+      }
+    } catch (e) {
+      console.warn("loadGroups: tables not ready yet", e);
     }
   }, [supabase]);
 
@@ -168,12 +172,16 @@ export function useSocket(): UseSocketReturn {
     setCurrentUser(user);
 
     // Ensure user exists in Supabase
-    await supabase.from("users").upsert({
-      id: user.id,
-      name: user.name,
-      avatar: user.avatar,
-      status: "online",
-    });
+    try {
+      await supabase.from("users").upsert({
+        id: user.id,
+        name: user.name,
+        avatar: user.avatar,
+        status: "online",
+      });
+    } catch (e) {
+      console.warn("joinServer: users table not ready yet", e);
+    }
 
     // Load existing groups
     await loadGroups(user.id);
@@ -207,26 +215,29 @@ export function useSocket(): UseSocketReturn {
     if (!currentUser) return;
     const groupId = crypto.randomUUID();
 
-    await supabase.from("chat_groups").insert({
-      id: groupId,
-      name,
-      created_by: currentUser.id,
-    });
+    try {
+      await supabase.from("chat_groups").insert({
+        id: groupId,
+        name,
+        created_by: currentUser.id,
+      });
 
-    // Add the human user
-    await supabase.from("group_members").insert({
-      group_id: groupId,
-      user_id: currentUser.id,
-      role: "admin",
-    });
-
-    // Add all AI agents to the group
-    for (const agentId of AGENT_IDS) {
       await supabase.from("group_members").insert({
         group_id: groupId,
-        user_id: agentId,
-        role: "member",
+        user_id: currentUser.id,
+        role: "admin",
       });
+
+      for (const agentId of AGENT_IDS) {
+        await supabase.from("group_members").insert({
+          group_id: groupId,
+          user_id: agentId,
+          role: "member",
+        });
+      }
+    } catch (e) {
+      console.warn("createGroup: tables not ready", e);
+      return;
     }
 
     const newGroup: ChatGroup = { id: groupId, name, createdBy: currentUser.id };
@@ -271,27 +282,30 @@ export function useSocket(): UseSocketReturn {
   // Send a message
   const sendMessage = useCallback(async (content: string) => {
     if (!currentUser || !currentGroupId) return;
-    const { data, error } = await supabase.from("messages").insert({
-      group_id: currentGroupId,
-      user_id: currentUser.id,
-      content,
-      name: currentUser.name,
-      avatar: currentUser.avatar,
-      type: "text",
-    }).select("id").single();
+    try {
+      const { data, error } = await supabase.from("messages").insert({
+        group_id: currentGroupId,
+        user_id: currentUser.id,
+        content,
+        name: currentUser.name,
+        avatar: currentUser.avatar,
+        type: "text",
+      }).select("id").single();
 
-    if (error) {
-      console.error("Error sending message:", error);
-      return;
-    }
+      if (error) {
+        console.error("Error sending message:", error);
+        return;
+      }
 
-    // Trigger AI responses via API route
-    if (data?.id) {
-      fetch("/api/chat/respond", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ groupId: currentGroupId, messageId: data.id }),
-      }).catch((err) => console.error("AI respond error:", err));
+      if (data?.id) {
+        fetch("/api/chat/respond", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ groupId: currentGroupId, messageId: data.id }),
+        }).catch((err) => console.error("AI respond error:", err));
+      }
+    } catch (e) {
+      console.warn("sendMessage: messages table not ready", e);
     }
   }, [currentUser, currentGroupId, supabase]);
 
@@ -322,24 +336,28 @@ export function useSocket(): UseSocketReturn {
 
   // Load message history for a group
   const loadGroupHistory = useCallback(async (groupId: string) => {
-    const { data } = await supabase
-      .from("messages")
-      .select("*")
-      .eq("group_id", groupId)
-      .order("created_at", { ascending: true });
+    try {
+      const { data } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("group_id", groupId)
+        .order("created_at", { ascending: true });
 
-    if (data) {
-      const mapped: Message[] = data.map((m: any) => ({
-        id: m.id,
-        groupId: m.group_id,
-        userId: m.user_id,
-        content: m.content,
-        name: m.name || "",
-        avatar: m.avatar || "",
-        type: m.type || "text",
-        createdAt: new Date(m.created_at).getTime(),
-      }));
-      setMessages(mapped);
+      if (data) {
+        const mapped: Message[] = data.map((m: any) => ({
+          id: m.id,
+          groupId: m.group_id,
+          userId: m.user_id,
+          content: m.content,
+          name: m.name || "",
+          avatar: m.avatar || "",
+          type: m.type || "text",
+          createdAt: new Date(m.created_at).getTime(),
+        }));
+        setMessages(mapped);
+      }
+    } catch (e) {
+      console.warn("loadGroupHistory: messages table not ready", e);
     }
   }, [supabase]);
 
