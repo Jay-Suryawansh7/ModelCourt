@@ -64,17 +64,5 @@ INSERT INTO users (id, name, avatar) VALUES
   ('agent-architect', 'Dev', 'https://api.dicebear.com/9.x/avataaars/svg?seed=dev-architect')
 ON CONFLICT (id) DO NOTHING;
 
--- 6. Enable Realtime for messages table
--- Run this separately in Supabase Dashboard if the function doesn't exist:
--- Go to Database > Replication > enable replication for 'messages' table
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_publication_tables 
-    WHERE pubname = 'supabase_realtime' 
-    AND tablename = 'messages'
-  ) THEN
-    ALTER PUBLICATION supabase_realtime ADD TABLE messages;
-  END IF;
-END
-$$;
+-- 6. Realtime is handled via Broadcast (free) — no replication needed.
+-- Messages are broadcast on group channels: `group:<group_id>`

@@ -1,5 +1,3 @@
-"use client";
-
 import { useEffect, useRef, useState, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { RealtimeChannel } from "@supabase/supabase-js";
@@ -44,7 +42,6 @@ export function useSocket(): UseSocketReturn {
 
   currentUserRef.current = currentUser;
 
-  // Load groups from Supabase
   const loadGroups = useCallback(async (userId: string) => {
     try {
       const { data } = await supabase
@@ -67,41 +64,22 @@ export function useSocket(): UseSocketReturn {
     }
   }, [supabase]);
 
-  // Subscribe to a group channel
+  // Subscribe to a group channel for real-time messages via Broadcast
   const subscribeToGroup = useCallback((groupId: string, userId: string) => {
     if (channelsRef.current.has(groupId)) return;
 
     const channel = supabase.channel(`group:${groupId}`);
 
-    // Listen for new messages via Postgres Changes
-    channel.on(
-      "postgres_changes",
-      {
-        event: "INSERT",
-        schema: "public",
-        table: "messages",
-        filter: `group_id=eq.${groupId}`,
-      },
-      (payload: any) => {
-        const newMsg = payload.new;
-        const msg: Message = {
-          id: newMsg.id,
-          groupId: newMsg.group_id,
-          userId: newMsg.user_id,
-          content: newMsg.content,
-          name: newMsg.name || "",
-          avatar: newMsg.avatar || "",
-          type: newMsg.type || "text",
-          createdAt: new Date(newMsg.created_at).getTime(),
-        };
-        setMessages((prev) => {
-          if (prev.find((m) => m.id === msg.id)) return prev;
-          return [...prev, msg];
-        });
-      }
-    );
+    // Listen for new messages via Broadcast (free, no replication needed)
+    channel.on("broadcast", { event: "new-message" }, (payload: any) => {
+      const msg = payload.payload as Message;
+      setMessages((prev) => {
+        if (prev.find((m) => m.id === msg.id)) return prev;
+        return [...prev, msg];
+      });
+    });
 
-    // Listen for typing broadcast
+    // Listen for typing events
     channel.on("broadcast", { event: "typing" }, (payload: any) => {
       const data = payload.payload as TypingUser;
       if (data.userId === userId) return;
@@ -109,7 +87,6 @@ export function useSocket(): UseSocketReturn {
         if (prev.find((t) => t.userId === data.userId)) return prev;
         return [...prev, data];
       });
-      // Auto-clear after timeout
       const timer = typingTimersRef.current.get(data.userId);
       if (timer) clearTimeout(timer);
       typingTimersRef.current.set(
@@ -120,7 +97,6 @@ export function useSocket(): UseSocketReturn {
       );
     });
 
-    // Listen for stop typing
     channel.on("broadcast", { event: "stop-typing" }, (payload: any) => {
       const { userId: typingUserId } = payload.payload;
       setTypingUsers((prev) => prev.filter((t) => t.userId !== typingUserId));
@@ -128,7 +104,7 @@ export function useSocket(): UseSocketReturn {
       if (timer) clearTimeout(timer);
     });
 
-    // Presence for online users in this group
+    // Presence for online users
     channel.on("presence", { event: "sync" }, () => {
       const presenceState = channel.presenceState();
       const users: User[] = [];
@@ -145,7 +121,6 @@ export function useSocket(): UseSocketReturn {
     channel.subscribe(async (status) => {
       if (status === "SUBSCRIBED") {
         setConnected(true);
-        // Track presence
         await channel.track({
           userId,
           name: currentUserRef.current?.name || "Unknown",
@@ -158,7 +133,6 @@ export function useSocket(): UseSocketReturn {
     channelsRef.current.set(groupId, channel);
   }, [supabase]);
 
-  // Unsubscribe from a group
   const unsubscribeFromGroup = useCallback((groupId: string) => {
     const channel = channelsRef.current.get(groupId);
     if (channel) {
@@ -171,7 +145,6 @@ export function useSocket(): UseSocketReturn {
   const joinServer = useCallback(async (user: User) => {
     setCurrentUser(user);
 
-    // Ensure user exists in Supabase
     try {
       await supabase.from("users").upsert({
         id: user.id,
@@ -183,10 +156,8 @@ export function useSocket(): UseSocketReturn {
       console.warn("joinServer: users table not ready yet", e);
     }
 
-    // Load existing groups
     await loadGroups(user.id);
 
-    // Subscribe to a global channel for group creation broadcasts
     const globalChannel = supabase.channel("global");
     globalChannel.on("broadcast", { event: "group-created" }, (payload: any) => {
       const newGroup = payload.payload as ChatGroup;
@@ -199,7 +170,6 @@ export function useSocket(): UseSocketReturn {
     channelsRef.current.set("global", globalChannel);
   }, [supabase, loadGroups]);
 
-  // Subscribe to all groups when they load
   useEffect(() => {
     if (!currentUser) return;
     groups.forEach((g) => {
@@ -242,7 +212,6 @@ export function useSocket(): UseSocketReturn {
 
     const newGroup: ChatGroup = { id: groupId, name, createdBy: currentUser.id };
 
-    // Broadcast via global channel
     const globalChannel = channelsRef.current.get("global");
     if (globalChannel) {
       await globalChannel.send({
@@ -258,7 +227,6 @@ export function useSocket(): UseSocketReturn {
     });
   }, [currentUser, supabase]);
 
-  // Join a group
   const joinGroup = useCallback(async (groupId: string, userId: string) => {
     await supabase.from("group_members").upsert({
       group_id: groupId,
@@ -268,7 +236,6 @@ export function useSocket(): UseSocketReturn {
     subscribeToGroup(groupId, userId);
   }, [supabase, subscribeToGroup]);
 
-  // Leave a group
   const leaveGroup = useCallback(async (groupId: string) => {
     if (!currentUser) return;
     await supabase.from("group_members").delete().match({
@@ -279,9 +246,23 @@ export function useSocket(): UseSocketReturn {
     setGroups((prev) => prev.filter((g) => g.id !== groupId));
   }, [currentUser, supabase, unsubscribeFromGroup]);
 
-  // Send a message
+  // Broadcast a message on the group channel
+  const broadcastMessage = useCallback(async (msg: Message) => {
+    const channel = channelsRef.current.get(msg.groupId);
+    if (channel) {
+      await channel.send({
+        type: "broadcast",
+        event: "new-message",
+        payload: msg,
+      });
+    }
+  }, []);
+
+  // Send a message: insert to DB + broadcast via Realtime + trigger AI
   const sendMessage = useCallback(async (content: string) => {
     if (!currentUser || !currentGroupId) return;
+
+    let messageId: string | null = null;
     try {
       const { data, error } = await supabase.from("messages").insert({
         group_id: currentGroupId,
@@ -296,20 +277,60 @@ export function useSocket(): UseSocketReturn {
         console.error("Error sending message:", error);
         return;
       }
-
-      if (data?.id) {
-        fetch("/api/chat/respond", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ groupId: currentGroupId, messageId: data.id }),
-        }).catch((err) => console.error("AI respond error:", err));
-      }
+      messageId = data?.id || null;
     } catch (e) {
       console.warn("sendMessage: messages table not ready", e);
     }
-  }, [currentUser, currentGroupId, supabase]);
 
-  // Typing indicators - broadcast via channel
+    // Build the message object and broadcast
+    const tempMsg: Message = {
+      id: messageId || crypto.randomUUID(),
+      groupId: currentGroupId,
+      userId: currentUser.id,
+      content,
+      name: currentUser.name,
+      avatar: currentUser.avatar,
+      type: "text",
+      createdAt: Date.now(),
+    };
+
+    await broadcastMessage(tempMsg);
+
+    // Trigger AI responses
+    if (messageId) {
+      fetch("/api/chat/respond", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ groupId: currentGroupId, messageId }),
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          if (data?.responses) {
+            // Broadcast each AI response on the group channel
+            data.responses.forEach((r: any, idx: number) => {
+              setTimeout(() => {
+                const agent = AGENTS.find((a) => a.name === r.name);
+                if (!agent) return;
+                const aiMsg: Message = {
+                  id: crypto.randomUUID(),
+                  groupId: currentGroupId,
+                  userId: agent.id,
+                  content: r.content,
+                  name: agent.name,
+                  avatar: agent.avatar,
+                  type: "text",
+                  createdAt: Date.now() + idx * 2000,
+                };
+                broadcastMessage(aiMsg);
+              }, idx * 2000);
+            });
+          }
+        })
+        .catch((err) => console.error("AI respond error:", err));
+    }
+  }, [currentUser, currentGroupId, supabase, broadcastMessage]);
+
+  // Typing indicators
   const emitTyping = useCallback(async () => {
     if (!currentUser || !currentGroupId) return;
     const channel = channelsRef.current.get(currentGroupId);
@@ -334,7 +355,7 @@ export function useSocket(): UseSocketReturn {
     }
   }, [currentUser, currentGroupId]);
 
-  // Load message history for a group
+  // Load message history from Supabase (for page load / refresh)
   const loadGroupHistory = useCallback(async (groupId: string) => {
     try {
       const { data } = await supabase
@@ -361,11 +382,9 @@ export function useSocket(): UseSocketReturn {
     }
   }, [supabase]);
 
-  // Load history when group changes
   useEffect(() => {
     if (currentGroupId) {
       loadGroupHistory(currentGroupId);
-      // Subscribe if not already subscribed
       if (currentUser) {
         subscribeToGroup(currentGroupId, currentUser.id);
       }
@@ -374,7 +393,6 @@ export function useSocket(): UseSocketReturn {
     }
   }, [currentGroupId, loadGroupHistory, currentUser, subscribeToGroup]);
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
       channelsRef.current.forEach((channel) => {
